@@ -480,11 +480,35 @@ private[spark] class TaskSchedulerImpl(
     }
   }
 
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  //                                 CHANGES BEGIN HERE                                         //
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+
+  /**
+    1. Hardcoded executor type
+    * Map executor type to score 
+    * Sort by score and shuffle within each type (shuffling TODO)
+    * 
+    2. Available memory
+    * Call sc.getExecutorMemoryStatus; returns map[String, (Long, Long)] with key executorID 
+      (host:port) and value (Maximum Memory, Remaining Memory); this needs to get changed because
+      it basically calls the API every time. 
+    * So the alternative is to piggy-back off of HeartbeatReceiver; 
+    * Sort by ratio (remaining / max), desc
+    * 
+    3. 
+    */
+
+
   /**
    * Called by cluster manager to offer resources on workers. We respond by asking our active task
    * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
    * that tasks are balanced across the cluster.
    */
+
+
   def resourceOffers(
       offers: IndexedSeq[WorkerOffer],
       isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
@@ -762,6 +786,12 @@ private[spark] class TaskSchedulerImpl(
       }
     }
   }
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  //                                  MORE CHANGES HERE                                         //
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////////////////////////////////////////////
 
   /**
    * Shuffle offers around to avoid always placing tasks on the same workers.  Exposed to allow
