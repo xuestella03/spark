@@ -488,17 +488,20 @@ private[spark] class TaskSchedulerImpl(
 
   /**
     1. Hardcoded executor type
-    * Map executor type to score 
-    * Sort by score and shuffle within each type (shuffling TODO)
-    * 
+      * Map executor type to score 
+      * Sort by score and shuffle within each type (shuffling TODO)
+      
     2. Available memory
-    * Call sc.getExecutorMemoryStatus; returns map[String, (Long, Long)] with key executorID 
-      (host:port) and value (Maximum Memory, Remaining Memory); this needs to get changed because
-      it basically calls the API every time. 
-    * So the alternative is to piggy-back off of HeartbeatReceiver; 
-    * Sort by ratio (remaining / max), desc
-    * 
-    3. 
+      * Call sc.getExecutorMemoryStatus; returns map[String, (Long, Long)] with key executorID 
+        (host:port) and value (Maximum Memory, Remaining Memory); this needs to get changed because
+        it basically calls the API every time. 
+      * So the alternative is to piggy-back off of HeartbeatReceiver; 
+      * Sort by ratio (remaining / max), desc
+    
+    3. Task Placement
+      * Sort different kinds of tasks based on hints. 
+      * PreferHighCPU and PreferHighMemory
+      
     */
 
 
@@ -509,6 +512,124 @@ private[spark] class TaskSchedulerImpl(
    */
 
 
+  // def resourceOffers(
+  //     offers: IndexedSeq[WorkerOffer],
+  //     isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
+  //   // Mark each worker as alive and remember its hostname
+  //   // Also track if new executor is added
+  //   var newExecAvail = false
+  //   for (o <- offers) {
+  //     if (!hostToExecutors.contains(o.host)) {
+  //       hostToExecutors(o.host) = new HashSet[String]()
+  //     }
+  //     if (!executorIdToRunningTaskIds.contains(o.executorId)) {
+  //       hostToExecutors(o.host) += o.executorId
+  //       executorAdded(o.executorId, o.host)
+  //       executorIdToHost(o.executorId) = o.host
+  //       executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
+  //       newExecAvail = true
+  //     }
+  //   }
+  //   val hosts = offers.map(_.host).distinct
+  //   for ((host, Some(rack)) <- hosts.zip(getRacksForHosts(hosts))) {
+  //     hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
+  //   }
+
+  //   // Before making any offers, include any nodes whose expireOnFailure timeout has expired. Do
+  //   // this here to avoid a separate thread and added synchronization overhead, and also because
+  //   // updating the excluded executors and nodes is only relevant when task offers are being made.
+  //   healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())
+
+  //   val filteredOffers = healthTrackerOpt.map { healthTracker =>
+  //     offers.filter { offer =>
+  //       !healthTracker.isNodeExcluded(offer.host) &&
+  //         !healthTracker.isExecutorExcluded(offer.executorId)
+  //     }
+  //   }.getOrElse(offers)
+
+
+  //   //
+  //   // Instead of the next section, do this:
+
+  //   /* 
+
+  //   // Sort offers based on capability (hardcoded)
+  //   scoredOffers = filteredOffers.sort(key=offer: capabilityScore(offer))
+
+  //   // Classify which kind of 
+
+  //   */
+
+
+  //   val shuffledOffers = shuffleOffers(filteredOffers)
+
+   /**
+   * Weighted scheduling for heterogeneous executors.
+   *
+   * Each executor is mapped to a weight read from spark conf:
+   *   spark.heterogeneous.executor.weights = "host1:4,host2:1"
+   *
+   * Higher weight = more capable = gets proportionally more tasks offered first.
+   * Within the same weight tier, offers are shuffled randomly to avoid starvation.
+   *
+   * With spark.executor.cores=1, each core on each physical node becomes its own
+   * WorkerOffer, so we get fine-grained control: Pi 5 cores get weight 4, Pi 3B+ cores
+   * get weight 1. Over a stage with 8 tasks, Pi 5 will tend to receive 6-7 and Pi 3B+ 1-2,
+   * roughly proportional to their relative throughput.
+   */
+
+  /**
+   * Parse "host1:4,host2:1" into Map("host1" -> 4, "host2" -> 1).
+   * Falls back to weight 1 for any host not listed (homogeneous fallback).
+   */
+  private val executorWeights: Map[String, Int] = {
+    conf.getOption("spark.heterogeneous.executor.weights").map { weightStr =>
+      weightStr.split(",").flatMap { entry =>
+        entry.split(":") match {
+          case Array(host, weight) => Some(host.trim -> weight.trim.toInt)
+          case _                   => None
+        }
+      }.toMap
+    }.getOrElse(Map.empty)
+  }
+
+  /**
+   * Return the weight for a given host. Defaults to 1 if not configured.
+   */
+  private def hostWeight(host: String): Int =
+    executorWeights.getOrElse(host, 1)
+
+  /**
+   * Order offers by weight descending, shuffling within each weight tier so that
+   * equal-weight executors don't always get the same task slot order.
+   *
+   * Example with Pi 5 (weight=4) having 4 executors and Pi 3B+ (weight=1) having 4:
+   *   Result: [pi5-exec0, pi5-exec2, pi5-exec1, pi5-exec3, pi3-exec1, pi3-exec0, pi3-exec2, pi3-exec3]
+   *
+   * Because resourceOfferSingleTaskSet iterates offers in order and assigns tasks greedily,
+   * higher-weight executors will fill up first.
+   */
+  private def weightedOrderOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
+    if (executorWeights.isEmpty) {
+      // No weights configured — fall back to existing random shuffle (no regression)
+      Random.shuffle(offers)
+    } else {
+      offers
+        .groupBy(o => hostWeight(o.host))   // group by weight
+        .toSeq
+        .sortBy(-_._1)                       // sort groups highest weight first
+        .flatMap { case (_, group) =>
+          Random.shuffle(group)              // shuffle within each weight tier
+        }
+        .toIndexedSeq
+    }
+  }
+
+  /**
+   * Called by cluster manager to offer resources on workers. We respond by asking our active task
+   * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
+   * that tasks are balanced across the cluster.
+   */
   def resourceOffers(
       offers: IndexedSeq[WorkerOffer],
       isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
@@ -532,9 +653,6 @@ private[spark] class TaskSchedulerImpl(
       hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
     }
 
-    // Before making any offers, include any nodes whose expireOnFailure timeout has expired. Do
-    // this here to avoid a separate thread and added synchronization overhead, and also because
-    // updating the excluded executors and nodes is only relevant when task offers are being made.
     healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())
 
     val filteredOffers = healthTrackerOpt.map { healthTracker =>
@@ -544,7 +662,13 @@ private[spark] class TaskSchedulerImpl(
       }
     }.getOrElse(offers)
 
-    val shuffledOffers = shuffleOffers(filteredOffers)
+    // Use weighted ordering instead of pure random shuffle.
+    // If no weights are configured this degrades to Random.shuffle (existing behavior).
+    val shuffledOffers = weightedOrderOffers(filteredOffers)
+
+    logInfo(s"[WeightedSched] Offer order: ${shuffledOffers.map(o => s"${o.host}(w=${hostWeight(o.host)})").mkString(", ")}")
+
+    /////////////////////////////////////////////////////////////////////////////////////
     // Build a list of tasks to assign to each worker.
     // Note the size estimate here might be off with different ResourceProfiles but should be
     // close estimate
