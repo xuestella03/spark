@@ -201,7 +201,7 @@ class SparkContext(config: SparkConf) extends Logging {
 
   // log out Spark Version in Spark driver log
   logInfo(log"Running Spark version ${MDC(LogKeys.SPARK_VERSION, SPARK_VERSION)}")
-  println("========== RUNNING CUSTOM BUILD (v0.2)==========")
+  println("========== RUNNING CUSTOM BUILD (v0.4)==========")
   logInfo(log"OS info ${MDC(LogKeys.OS_NAME, Utils.osName)}," +
     log" ${MDC(LogKeys.OS_VERSION, Utils.osVersion)}, " +
     log"${MDC(LogKeys.OS_ARCH, Utils.osArch)}")
@@ -3280,6 +3280,16 @@ object SparkContext extends Logging {
       .map(Utils.memoryStringToMb)
       .getOrElse(1024)
   }
+
+  // // To allow for different executor memory for nodes, read directly from the 
+  // // spark-env.sh file of that node.
+  // // In practice, this should have more error fallback mechanisms. 
+  // private[spark] def executorMemoryInMb(conf: SparkConf): Int = {
+  // Option(System.getenv("SPARK_EXECUTOR_MEMORY"))
+  //   .map(Utils.memoryStringToMb)
+  //   .getOrElse(throw new SparkException(
+  //     "SPARK_EXECUTOR_MEMORY must be set in spark-env.sh"))
+  // }
 
   private def warnSparkMem(value: String): String = {
     logWarning("Using SPARK_MEM to set amount of memory to use per executor process is " +
