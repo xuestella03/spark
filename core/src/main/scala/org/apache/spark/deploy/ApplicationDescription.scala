@@ -21,6 +21,29 @@ import java.net.URI
 
 import org.apache.spark.resource.{ResourceProfile, ResourceRequirement, ResourceUtils}
 
+// private[spark] case class ApplicationDescription(
+//     name: String,
+//     maxCores: Option[Int],
+//     command: Command,
+//     appUiUrl: String,
+//     defaultProfile: ResourceProfile,
+//     eventLogDir: Option[URI] = None,
+//     // short name of compression codec used when writing event logs, if any (e.g. lzf)
+//     eventLogCodec: Option[String] = None,
+//     // number of executors this application wants to start with,
+//     // only used if dynamic allocation is enabled
+//     initialExecutorLimit: Option[Int] = None,
+//     user: String = System.getProperty("user.name", "<unknown>")) {
+
+//   def memoryPerExecutorMB: Int = defaultProfile.getExecutorMemory.map(_.toInt).getOrElse(1024)
+//   def coresPerExecutor: Option[Int] = defaultProfile.getExecutorCores
+//   def resourceReqsPerExecutor: Seq[ResourceRequirement] =
+//     ResourceUtils.executorResourceRequestToRequirement(
+//       defaultProfile.getCustomExecutorResources().values.toSeq.sortBy(_.resourceName))
+
+//   override def toString: String = "ApplicationDescription(" + name + ")"
+// }
+
 private[spark] case class ApplicationDescription(
     name: String,
     maxCores: Option[Int],
@@ -28,15 +51,23 @@ private[spark] case class ApplicationDescription(
     appUiUrl: String,
     defaultProfile: ResourceProfile,
     eventLogDir: Option[URI] = None,
-    // short name of compression codec used when writing event logs, if any (e.g. lzf)
     eventLogCodec: Option[String] = None,
-    // number of executors this application wants to start with,
-    // only used if dynamic allocation is enabled
     initialExecutorLimit: Option[Int] = None,
-    user: String = System.getProperty("user.name", "<unknown>")) {
+    user: String = System.getProperty("user.name", "<unknown>"),
+    // per-host executor memory overrides in MB
+    // key = hostname, value = memory in MB
+    // if a host is not in this map, memoryPerExecutorMB is used as fallback
+    memoryPerExecutorMBByHost: Map[String, Int] = Map.empty) {
 
-  def memoryPerExecutorMB: Int = defaultProfile.getExecutorMemory.map(_.toInt).getOrElse(1024)
+  def memoryPerExecutorMB: Int =
+    defaultProfile.getExecutorMemory.map(_.toInt).getOrElse(1024)
+
+  // NEW: look up per-host memory, fall back to default
+  def memoryPerExecutorMBForHost(host: String): Int =
+    memoryPerExecutorMBByHost.getOrElse(host, memoryPerExecutorMB)
+
   def coresPerExecutor: Option[Int] = defaultProfile.getExecutorCores
+
   def resourceReqsPerExecutor: Seq[ResourceRequirement] =
     ResourceUtils.executorResourceRequestToRequirement(
       defaultProfile.getCustomExecutorResources().values.toSeq.sortBy(_.resourceName))

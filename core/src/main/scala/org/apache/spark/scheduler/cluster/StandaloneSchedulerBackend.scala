@@ -130,8 +130,36 @@ private[spark] class StandaloneSchedulerBackend(
       } else {
         None
       }
-    val appDesc = ApplicationDescription(sc.appName, maxCores, command,
-      webUrl, defaultProfile = defaultProf, sc.eventLogDir, sc.eventLogCodec, initialExecutorLimit)
+    // val appDesc = ApplicationDescription(sc.appName, maxCores, command,
+    //   webUrl, defaultProfile = defaultProf, sc.eventLogDir, sc.eventLogCodec, initialExecutorLimit)
+
+    // FOR DIFFERENT EXECUTOR MEMORY      
+    // Parse "host1:mem1,host2:mem2" e.g. "192.168.50.196:128m,192.168.50.197:1400m"
+    val perHostMemoryMB: Map[String, Int] = conf
+      .getOption("spark.heterogeneous.executor.memory")
+      .map { spec =>
+        spec.split(",").flatMap { entry =>
+          entry.split(":") match {
+            case Array(host, mem) =>
+              Some(host.trim -> Utils.memoryStringToMb(mem.trim))
+            case _ =>
+              None
+          }
+        }.toMap
+      }.getOrElse(Map.empty)
+
+    val appDesc = ApplicationDescription(
+      sc.appName,
+      maxCores,
+      command,
+      webUrl,
+      defaultProfile = defaultProf,
+      sc.eventLogDir,
+      sc.eventLogCodec,
+      initialExecutorLimit,
+      memoryPerExecutorMBByHost = perHostMemoryMB)  // NEW
+
+    client = new StandaloneAppClient(sc.env.rpcEnv, masters, appDesc, this, conf)
     client = new StandaloneAppClient(sc.env.rpcEnv, masters, appDesc, this, conf)
     client.start()
     launcherBackend.setState(SparkAppHandle.State.SUBMITTED)

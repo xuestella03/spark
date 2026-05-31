@@ -755,7 +755,7 @@ private[deploy] class Master(
     val coresPerExecutor = resourceDesc.coresPerExecutor
     val minCoresPerExecutor = coresPerExecutor.getOrElse(1)
     val oneExecutorPerWorker = coresPerExecutor.isEmpty
-    val memoryPerExecutor = resourceDesc.memoryMbPerExecutor
+    // val memoryPerExecutor = resourceDesc.memoryMbPerExecutor
     val resourceReqsPerExecutor = resourceDesc.customResourcesPerExecutor
     val numUsable = usableWorkers.length
     val assignedCores = new Array[Int](numUsable) // Number of cores to give to each worker
@@ -772,6 +772,9 @@ private[deploy] class Master(
       // Otherwise, if there is already an executor on this worker, just give it more cores.
       val launchingNewExecutor = !oneExecutorPerWorker || assignedExecutorNum == 0
       if (launchingNewExecutor) {
+        // new line 
+        val memoryPerExecutor = app.desc.memoryPerExecutorMBForHost(usableWorkers(pos).host)
+        //
         val assignedMemory = assignedExecutorNum * memoryPerExecutor
         val enoughMemory = usableWorkers(pos).memoryFree - assignedMemory >= memoryPerExecutor
         val assignedResources = resourceReqsPerExecutor.map {
@@ -844,7 +847,8 @@ private[deploy] class Master(
         if (app.coresLeft >= coresPerExecutor) {
           // Filter out workers that don't have enough resources to launch an executor
           val aliveWorkers = workers.toArray.filter(_.state == WorkerState.ALIVE)
-            .filter(canLaunchExecutor(_, resourceDesc))
+            // .filter(canLaunchExecutor(_, resourceDesc))
+            .filter(w => canLaunch(w, app.desc.memoryPerExecutorMBForHost(w.host), resourceDesc.coresPerExecutor.getOrElse(1), resourceDesc.customResourcesPerExecutor))
           val usableWorkers = workerSelectionPolicy match {
             case CORES_FREE_ASC => aliveWorkers.sortBy(w => (w.coresFree, w.id))
             case CORES_FREE_DESC => aliveWorkers.sortBy(w => (w.coresFree, w.id)).reverse
@@ -898,7 +902,8 @@ private[deploy] class Master(
     for (i <- 1 to numExecutors) {
       val allocated = worker.acquireResources(resourceDesc.customResourcesPerExecutor)
       val exec = app.addExecutor(
-        worker, coresToAssign, resourceDesc.memoryMbPerExecutor, allocated, rpId)
+        // worker, coresToAssign, resourceDesc.memoryMbPerExecutor, allocated, rpId)
+        worker, coresToAssign, app.desc.memoryPerExecutorMBForHost(worker.host), allocated, rpId)
       launchExecutor(worker, exec)
       app.state = ApplicationState.RUNNING
     }
