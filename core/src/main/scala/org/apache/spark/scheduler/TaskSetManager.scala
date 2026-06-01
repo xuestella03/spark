@@ -1359,23 +1359,24 @@ private[spark] class TaskSetManager(
    *
    */
   private def computeValidLocalityLevels(): Array[TaskLocality.TaskLocality] = {
-    import TaskLocality.{PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY}
+    // import TaskLocality.{PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY}
+    import TaskLocality.ANY
     val levels = new ArrayBuffer[TaskLocality.TaskLocality]
-    if (!pendingTasks.forExecutor.isEmpty &&
-        pendingTasks.forExecutor.keySet.exists(sched.isExecutorAlive(_))) {
-      levels += PROCESS_LOCAL
-    }
-    if (!pendingTasks.forHost.isEmpty &&
-        pendingTasks.forHost.keySet.exists(sched.hasExecutorsAliveOnHost(_))) {
-      levels += NODE_LOCAL
-    }
-    if (!pendingTasks.noPrefs.isEmpty) {
-      levels += NO_PREF
-    }
-    if (!pendingTasks.forRack.isEmpty &&
-        pendingTasks.forRack.keySet.exists(sched.hasHostAliveOnRack(_))) {
-      levels += RACK_LOCAL
-    }
+    // if (!pendingTasks.forExecutor.isEmpty &&
+    //     pendingTasks.forExecutor.keySet.exists(sched.isExecutorAlive(_))) {
+    //   levels += PROCESS_LOCAL
+    // }
+    // if (!pendingTasks.forHost.isEmpty &&
+    //     pendingTasks.forHost.keySet.exists(sched.hasExecutorsAliveOnHost(_))) {
+    //   levels += NODE_LOCAL
+    // }
+    // if (!pendingTasks.noPrefs.isEmpty) {
+    //   levels += NO_PREF
+    // }
+    // if (!pendingTasks.forRack.isEmpty &&
+    //     pendingTasks.forRack.keySet.exists(sched.hasHostAliveOnRack(_))) {
+    //   levels += RACK_LOCAL
+    // }
     levels += ANY
     logDebug("Valid locality levels for " + taskSet + ": " + levels.mkString(", "))
     levels.toArray
