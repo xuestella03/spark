@@ -563,6 +563,7 @@ private[spark] class TaskSchedulerImpl(
 
   //   val shuffledOffers = shuffleOffers(filteredOffers)
 
+
    /**
    * Weighted scheduling for heterogeneous executors.
    *
@@ -582,6 +583,9 @@ private[spark] class TaskSchedulerImpl(
    * Parse "host1:4,host2:1" into Map("host1" -> 4, "host2" -> 1).
    * Falls back to weight 1 for any host not listed (homogeneous fallback).
    */
+  private val stageAwareSchedulingEnabled: Boolean =
+  conf.getBoolean("spark.heterogeneous.scheduling.stageAware", defaultValue = false)
+
   private val executorWeights: Map[String, Int] = {
     conf.getOption("spark.heterogeneous.executor.weights").map { weightStr =>
       weightStr.split(",").flatMap { entry =>
@@ -625,6 +629,89 @@ private[spark] class TaskSchedulerImpl(
     }
   }
 
+  private sealed trait StageSpeed
+  private case object SlowStage extends StageSpeed
+  private case object FastStage extends StageSpeed
+
+  private def classifyStageSpeed(taskSet: TaskSetManager): StageSpeed = {
+    if (taskSet.numTasks == 1) FastStage
+    else SlowStage
+  }
+
+  private val operationAwareSchedulingEnabled: Boolean =
+    conf.getBoolean("spark.heterogeneous.scheduling.operationAware", defaultValue = false)
+
+  private val computeHeavyTaskThreshold: Int =
+    conf.getInt("spark.heterogeneous.scheduling.computeHeavyThreshold", defaultValue = 12)
+
+  private sealed trait OperationType
+  private case object ComputeHeavy extends OperationType
+  private case object IoLight      extends OperationType
+
+  private def classifyOperation(taskSet: TaskSetManager): OperationType = {
+    // val description = Option(taskSet.taskSet.properties.getProperty("spark.job.description"))
+    //   .getOrElse("").toLowerCase
+    // logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} job description: '$description'")
+    val rddScopeJson = Option(taskSet.taskSet.properties.getProperty("spark.rdd.scope"))
+      .getOrElse("")
+    val description = if (rddScopeJson.nonEmpty) {
+      // Extract "name" field from JSON - simple approach
+      val namePattern = """"name"\s*:\s*"([^"]+)"""".r
+      namePattern.findFirstMatchIn(rddScopeJson).map(_.group(1)).getOrElse("Unknown")
+    } else {
+      "Unknown"
+    }
+    logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} RDD Operation: $description")
+
+    val isScan = description.toLowerCase.contains("scan") || 
+                description.toLowerCase.contains("filescan") ||
+                description.toLowerCase.contains("csv") ||
+                description.toLowerCase.contains("parquet")
+    val isAggregate = description.toLowerCase.contains("aggregate") ||
+                      description.toLowerCase.contains("wholestagecodegen") // often wraps agg
+    val isExchange = description.toLowerCase.contains("exchange")
+    val isBroadcast = description.toLowerCase.contains("broadcast")
+    val isSort = description.toLowerCase.contains("sort")
+    val taskCountHeavy = taskSet.numTasks >= computeHeavyTaskThreshold
+
+    if (isBroadcast) {
+      IoLight
+    } else if (isScan || isAggregate || isSort || (taskCountHeavy && !isExchange)) {
+      ComputeHeavy
+    } else if (isExchange) {
+      IoLight
+    } else {
+      if (taskCountHeavy) ComputeHeavy else IoLight
+    }
+  }
+
+
+  private def stageAwareOrderOffers(
+      offers: IndexedSeq[WorkerOffer],   
+      speed: StageSpeed): IndexedSeq[WorkerOffer] = {
+    if (executorWeights.isEmpty) return Random.shuffle(offers)
+    val grouped = offers.groupBy(o => hostWeight(o.host)).toSeq
+    speed match {
+      case SlowStage =>
+        grouped.sortBy(-_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+      case FastStage =>
+        grouped.sortBy(_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+    }
+  }
+
+  private def operationAwareOrderOffers(
+      offers: IndexedSeq[WorkerOffer],
+      op: OperationType): IndexedSeq[WorkerOffer] = {
+    if (executorWeights.isEmpty) return Random.shuffle(offers)
+    val grouped = offers.groupBy(o => hostWeight(o.host)).toSeq
+    op match {
+      case ComputeHeavy =>
+        grouped.sortBy(-_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+      case IoLight =>
+        grouped.sortBy(_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+    }
+  }
+
   /**
    * Called by cluster manager to offer resources on workers. We respond by asking our active task
    * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
@@ -662,21 +749,23 @@ private[spark] class TaskSchedulerImpl(
       }
     }.getOrElse(offers)
 
-    // Use weighted ordering instead of pure random shuffle.
-    // If no weights are configured this degrades to Random.shuffle (existing behavior).
+    // Use weighted ordering as the canonical index basis.
+    // If stageAware is enabled we re-order per taskSet inside the loop below.
     val shuffledOffers = weightedOrderOffers(filteredOffers)
 
     logInfo(s"[WeightedSched] Offer order: ${shuffledOffers.map(o => s"${o.host}(w=${hostWeight(o.host)})").mkString(", ")}")
 
-    /////////////////////////////////////////////////////////////////////////////////////
-    // Build a list of tasks to assign to each worker.
-    // Note the size estimate here might be off with different ResourceProfiles but should be
-    // close estimate
+    // Build index-parallel arrays keyed to shuffledOffers.
     val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK))
     val availableResources = shuffledOffers.map(_.resources).toArray
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
+
+    // Index from executorId -> position in shuffledOffers (for barrier tasks later).
+    val executorIdToIndex: Map[String, Int] =
+      shuffledOffers.zipWithIndex.map { case (o, i) => o.executorId -> i }.toMap
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
+
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
         taskSet.parent.name, taskSet.name, taskSet.runningTasks))
@@ -708,6 +797,30 @@ private[spark] class TaskSchedulerImpl(
           log"${MDC(LogKeys.TASK_SET_NAME, taskSet.numTasks)} slots, while the total " +
           log"number of available slots is ${MDC(LogKeys.NUM_SLOTS, numBarrierSlotsAvailable)}.")
       } else {
+        // Per-taskSet offer ordering. If stageAware is on, classify and reorder.
+        // orderedOffers must be a permutation of shuffledOffers so that the index-parallel
+        // arrays (tasks, availableCpus, availableResources) remain consistent.
+        val orderedOffers: IndexedSeq[WorkerOffer] = {
+          if (operationAwareSchedulingEnabled) {
+            val op = classifyOperation(taskSet)
+            logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} classified as $op " +
+              s"(tasks=${taskSet.numTasks})")
+            operationAwareOrderOffers(shuffledOffers, op)
+          } else if (stageAwareSchedulingEnabled) {
+            val speed = classifyStageSpeed(taskSet)
+            logInfo(s"[StageAwareSched] Stage ${taskSet.stageId} classified as $speed " +
+              s"(tasks=${taskSet.numTasks}, localities=${taskSet.myLocalityLevels.mkString(",")})")
+            stageAwareOrderOffers(shuffledOffers, speed)
+          } else {
+            shuffledOffers
+          }
+        }
+
+        // Remap index-parallel arrays to match orderedOffers order.
+        val orderedTasks           = orderedOffers.map(o => tasks(executorIdToIndex(o.executorId)))
+        val orderedAvailableCpus   = orderedOffers.map(o => availableCpus(executorIdToIndex(o.executorId))).toArray
+        val orderedAvailableRes    = orderedOffers.map(o => availableResources(executorIdToIndex(o.executorId))).toArray
+
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
@@ -715,13 +828,20 @@ private[spark] class TaskSchedulerImpl(
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
-              taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks)
+              taskSet, currentMaxLocality, orderedOffers, orderedAvailableCpus,
+              orderedAvailableRes, orderedTasks)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
             globalMinLocality = minTaskLocality(globalMinLocality, minLocality)
           } while (launchedTaskAtCurrentMaxLocality)
+        }
+
+        // Write back mutated cpu/resource state from ordered arrays to canonical shuffledOffers arrays.
+        orderedOffers.zipWithIndex.foreach { case (o, oi) =>
+          val si = executorIdToIndex(o.executorId)
+          availableCpus(si) = orderedAvailableCpus(oi)
+          availableResources(si) = orderedAvailableRes(oi)
         }
 
         if (!legacyLocalityWaitReset) {
@@ -852,8 +972,8 @@ private[spark] class TaskSchedulerImpl(
                 task.assignedResources,
                 launchTime)
               addRunningTask(taskDesc.taskId, taskDesc.executorId, taskSet)
-              tasks(task.assignedOfferIndex) += taskDesc
-              shuffledOffers(task.assignedOfferIndex).address.get -> taskDesc
+              tasks(task.assignedOfferIndex) += taskDesc // might be tied to shuffledOffers, not orderedOffers, need to fix
+              orderedOffers(task.assignedOfferIndex).address.get -> taskDesc
             }
 
             // materialize the barrier coordinator.

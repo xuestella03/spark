@@ -201,7 +201,7 @@ class SparkContext(config: SparkConf) extends Logging {
 
   // log out Spark Version in Spark driver log
   logInfo(log"Running Spark version ${MDC(LogKeys.SPARK_VERSION, SPARK_VERSION)}")
-  println("========== RUNNING CUSTOM BUILD (v0.4)==========")
+  println("========== RUNNING CUSTOM BUILD (v7.1)==========")
   logInfo(log"OS info ${MDC(LogKeys.OS_NAME, Utils.osName)}," +
     log" ${MDC(LogKeys.OS_VERSION, Utils.osVersion)}, " +
     log"${MDC(LogKeys.OS_ARCH, Utils.osArch)}")
