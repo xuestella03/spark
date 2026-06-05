@@ -376,25 +376,29 @@ private[spark] class TaskSchedulerImpl(
    * @return tuple of (no delay schedule rejects?, option of min locality of launched task)
    */
   private def resourceOfferSingleTaskSet(
-      taskSet: TaskSetManager,
-      maxLocality: TaskLocality,
-      shuffledOffers: Seq[WorkerOffer],
-      availableCpus: Array[Int],
-      availableResources: Array[ExecutorResourcesAmounts],
-      tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
+    taskSet: TaskSetManager,
+    maxLocality: TaskLocality,
+    shuffledOffers: Seq[WorkerOffer],
+    availableCpus: Array[Int],
+    availableResources: Array[ExecutorResourcesAmounts],
+    tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
     : (Boolean, Option[TaskLocality]) = {
     var noDelayScheduleRejects = true
     var minLaunchedLocality: Option[TaskLocality] = None
-    // nodes and executors that are excluded for the entire application have already been
-    // filtered out by this point
+    // Compute operation type once per taskSet, not per offer
+    val opType = if (operationAwareSchedulingEnabled) Some(classifyOperation(taskSet)) else None
     for (i <- shuffledOffers.indices) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
       val taskSetRpID = taskSet.taskSet.resourceProfileId
-
-      // check whether the task can be scheduled to the executor base on resource profile.
-      if (sc.resourceProfileManager
-        .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
+      val weight = opType match {
+        case Some(op) => effectiveHostWeight(host, op, taskSet.numTasks)
+        case None     => hostWeight(host)
+      }
+      if (weight <= 0) {
+        logInfo(s"[WeightedSched] Host $host excluded (weight=0), skipping offer $i")
+      } else if (sc.resourceProfileManager.canBeScheduled(
+        taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, availableCpus(i),
           availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
@@ -644,44 +648,75 @@ private[spark] class TaskSchedulerImpl(
   private val computeHeavyTaskThreshold: Int =
     conf.getInt("spark.heterogeneous.scheduling.computeHeavyThreshold", defaultValue = 12)
 
+  private val slowHost: Option[String] =
+    conf.getOption("spark.heterogeneous.scheduling.slowHost").map(_.trim)
+  
+  private val scanSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.scan.slowdown", 5.0)
+  private val reduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.reduce.slowdown", 5.5)
+  private val fastHostCores: Int =
+    conf.getInt("spark.heterogeneous.scheduling.fastHostCores", 4)
+
   private sealed trait OperationType
-  private case object ComputeHeavy extends OperationType
-  private case object IoLight      extends OperationType
+  private case object ScanHeavy   extends OperationType  // exclude slow host
+  private case object ShuffleLight extends OperationType // include slow host
+  private case object Other        extends OperationType // include slow host
 
   private def classifyOperation(taskSet: TaskSetManager): OperationType = {
-    // val description = Option(taskSet.taskSet.properties.getProperty("spark.job.description"))
-    //   .getOrElse("").toLowerCase
-    // logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} job description: '$description'")
-    val rddScopeJson = Option(taskSet.taskSet.properties.getProperty("spark.rdd.scope"))
-      .getOrElse("")
-    val description = if (rddScopeJson.nonEmpty) {
-      // Extract "name" field from JSON - simple approach
-      val namePattern = """"name"\s*:\s*"([^"]+)"""".r
-      namePattern.findFirstMatchIn(rddScopeJson).map(_.group(1)).getOrElse("Unknown")
-    } else {
-      "Unknown"
-    }
-    logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} RDD Operation: $description")
+    val props = taskSet.taskSet.properties
+    val readsShuffle = Option(props)
+      .map(_.getProperty("spark.stage.readsShuffleInput", "false"))
+      .exists(_.toBoolean)
 
-    val isScan = description.toLowerCase.contains("scan") || 
-                description.toLowerCase.contains("filescan") ||
-                description.toLowerCase.contains("csv") ||
-                description.toLowerCase.contains("parquet")
-    val isAggregate = description.toLowerCase.contains("aggregate") ||
-                      description.toLowerCase.contains("wholestagecodegen") // often wraps agg
-    val isExchange = description.toLowerCase.contains("exchange")
-    val isBroadcast = description.toLowerCase.contains("broadcast")
-    val isSort = description.toLowerCase.contains("sort")
-    val taskCountHeavy = taskSet.numTasks >= computeHeavyTaskThreshold
+    // scope name kept for logging/diagnostics only, not for the decision
+    val opName = Option(props).flatMap(p => Option(p.getProperty("spark.rdd.scope")))
+      .flatMap(s => """"name"\s*:\s*"([^"]+)"""".r.findFirstMatchIn(s).map(_.group(1)))
+      .getOrElse("Unknown")
 
-    if (isBroadcast) {
-      IoLight
-    } else if (isScan || isAggregate || isSort || (taskCountHeavy && !isExchange)) {
-      ComputeHeavy
-    } else if (isExchange) {
-      IoLight
+    val opType = if (readsShuffle) ShuffleLight else ScanHeavy
+
+    logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} op='$opName' " +
+            s"readsShuffle=$readsShuffle tasks=${taskSet.numTasks} -> $opType")
+
+    opType
+  }
+
+  // // Call this to get the effective weight for a host given the current operation type.
+  // // Returns 0 to exclude, otherwise the configured weight.
+  // private def effectiveHostWeight(host: String, op: OperationType): Int = {
+  //   val baseWeight = hostWeight(host)  // your existing method
+  //   op match {
+  //     case ScanHeavy =>
+  //       if (operationAwareSchedulingEnabled && slowHost.contains(host)) 0
+  //       else baseWeight
+  //     case ShuffleLight | Other =>
+  //       // Always include — use base weight (at least 1)
+  //       if (baseWeight <= 0) 1 else baseWeight
+  //   }
+  // }
+
+  private def fastHostWaves(numTasks: Int): Int =
+    math.ceil(numTasks.toDouble / math.max(fastHostCores, 1)).toInt
+
+  private def effectiveSlowdown(op: OperationType): Double = op match {
+    case ScanHeavy            => scanSlowdown
+    case ShuffleLight | Other => reduceSlowdown
+  }
+
+  private def slowHostFits(numTasks: Int, op: OperationType): Boolean =
+    fastHostWaves(numTasks) > effectiveSlowdown(op)
+
+  private def effectiveHostWeight(host: String, op: OperationType, numTasks: Int): Int = {
+    val baseWeight = hostWeight(host)
+    if (!operationAwareSchedulingEnabled || !slowHost.contains(host)) {
+      baseWeight
     } else {
-      if (taskCountHeavy) ComputeHeavy else IoLight
+      val waves = fastHostWaves(numTasks)
+      val fits  = slowHostFits(numTasks, op)
+      logInfo(s"[OpAwareSched] slowHost=$host op=$op tasks=$numTasks " +
+        s"waves=$waves r=${effectiveSlowdown(op)} fits=$fits -> ${if (fits) "INCLUDE" else "EXCLUDE"}")
+      if (fits) math.max(baseWeight, 1) else 0
     }
   }
 
@@ -699,18 +734,7 @@ private[spark] class TaskSchedulerImpl(
     }
   }
 
-  private def operationAwareOrderOffers(
-      offers: IndexedSeq[WorkerOffer],
-      op: OperationType): IndexedSeq[WorkerOffer] = {
-    if (executorWeights.isEmpty) return Random.shuffle(offers)
-    val grouped = offers.groupBy(o => hostWeight(o.host)).toSeq
-    op match {
-      case ComputeHeavy =>
-        grouped.sortBy(-_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
-      case IoLight =>
-        grouped.sortBy(_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
-    }
-  }
+
 
   /**
    * Called by cluster manager to offer resources on workers. We respond by asking our active task
@@ -797,16 +821,17 @@ private[spark] class TaskSchedulerImpl(
           log"${MDC(LogKeys.TASK_SET_NAME, taskSet.numTasks)} slots, while the total " +
           log"number of available slots is ${MDC(LogKeys.NUM_SLOTS, numBarrierSlotsAvailable)}.")
       } else {
+
+        if (operationAwareSchedulingEnabled) {
+          val op = classifyOperation(taskSet)
+          logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} op=$op " +
+            s"(tasks=${taskSet.numTasks})")
+        }
         // Per-taskSet offer ordering. If stageAware is on, classify and reorder.
         // orderedOffers must be a permutation of shuffledOffers so that the index-parallel
         // arrays (tasks, availableCpus, availableResources) remain consistent.
         val orderedOffers: IndexedSeq[WorkerOffer] = {
-          if (operationAwareSchedulingEnabled) {
-            val op = classifyOperation(taskSet)
-            logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} classified as $op " +
-              s"(tasks=${taskSet.numTasks})")
-            operationAwareOrderOffers(shuffledOffers, op)
-          } else if (stageAwareSchedulingEnabled) {
+          if (stageAwareSchedulingEnabled) {
             val speed = classifyStageSpeed(taskSet)
             logInfo(s"[StageAwareSched] Stage ${taskSet.stageId} classified as $speed " +
               s"(tasks=${taskSet.numTasks}, localities=${taskSet.myLocalityLevels.mkString(",")})")

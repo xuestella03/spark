@@ -1629,6 +1629,15 @@ private[spark] class DAGScheduler(
     // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
     // with this Stage
     val properties = jobIdToActiveJob(jobId).properties
+
+    // CHANGES
+    val readsShuffleInput = getShuffleDependenciesAndResourceProfiles(stage.rdd)._1.nonEmpty
+    val taskSetProperties = new java.util.Properties()
+    if (properties != null) taskSetProperties.putAll(properties)   
+    taskSetProperties.setProperty("spark.stage.readsShuffleInput", readsShuffleInput.toString)
+    //
+
+
     addPySparkConfigsToProperties(stage, properties)
 
     runningStages += stage
@@ -1780,8 +1789,9 @@ private[spark] class DAGScheduler(
         case _: ResultStage => None
       }
 
+      // CHANGE HERE
       taskScheduler.submitTasks(new TaskSet(
-        tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
+        tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, taskSetProperties, // change here 
         stage.resourceProfileId, shuffleId))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
