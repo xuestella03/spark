@@ -391,8 +391,9 @@ private[spark] class TaskSchedulerImpl(
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
       val taskSetRpID = taskSet.taskSet.resourceProfileId
+      // val slowLaunched = slowHostLaunchCount.getOrDefault(taskSet.taskSet.id, 0).intValue()
       val weight = opType match {
-        case Some(op) => effectiveHostWeight(host, op, taskSet.numTasks)
+        case Some(op) => effectiveHostWeight(host, op, taskSet.numTasks)//, slowLaunched)
         case None     => hostWeight(host)
       }
       if (weight <= 0) {
@@ -645,78 +646,97 @@ private[spark] class TaskSchedulerImpl(
   private val operationAwareSchedulingEnabled: Boolean =
     conf.getBoolean("spark.heterogeneous.scheduling.operationAware", defaultValue = false)
 
-  private val computeHeavyTaskThreshold: Int =
-    conf.getInt("spark.heterogeneous.scheduling.computeHeavyThreshold", defaultValue = 12)
+  // private val computeHeavyTaskThreshold: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.computeHeavyThreshold", defaultValue = 12)
 
   private val slowHost: Option[String] =
     conf.getOption("spark.heterogeneous.scheduling.slowHost").map(_.trim)
   
   private val scanSlowdown: Double =
     conf.getDouble("spark.heterogeneous.scheduling.scan.slowdown", 5.0)
-  private val reduceSlowdown: Double =
-    conf.getDouble("spark.heterogeneous.scheduling.reduce.slowdown", 5.5)
+  private val aggReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.aggReduce.slowdown", 4.5)
+  private val sortReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.sortReduce.slowdown", 7.0)
+  private val joinReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.joinReduce.slowdown", 99.0) // ~never fits
   private val fastHostCores: Int =
     conf.getInt("spark.heterogeneous.scheduling.fastHostCores", 4)
 
+  // one-wave
+  // private val oneWaveCapEnabled: Boolean =
+  //   conf.getBoolean("spark.heterogeneous.scheduling.oneWaveCap", defaultValue = false)
+  // private val slowHostCores: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.slowHostCores", 4)
+  // private val slowHostMaxTasksConf: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.slowHostMaxTasks", -1)
+  // private def slowHostCap: Int =
+  //   if (slowHostMaxTasksConf > 0) slowHostMaxTasksConf else slowHostCores
+
+  // // per stage-attempt id -> tasks already launched on the slow host
+  // private val slowHostLaunchCount =
+  //   new java.util.concurrent.ConcurrentHashMap[String, Integer]()
+  
+  
   private sealed trait OperationType
-  private case object ScanHeavy   extends OperationType  // exclude slow host
-  private case object ShuffleLight extends OperationType // include slow host
-  private case object Other        extends OperationType // include slow host
+  private case object ScanHeavy  extends OperationType // file scan / map side
+  private case object AggReduce  extends OperationType // hash-partitioned terminal reduce
+  private case object SortReduce extends OperationType // range-partitioned reduce (ORDER BY)
+  private case object JoinReduce extends OperationType // reads AND writes shuffle (SMJ etc.)
 
   private def classifyOperation(taskSet: TaskSetManager): OperationType = {
-    val props = taskSet.taskSet.properties
-    val readsShuffle = Option(props)
-      .map(_.getProperty("spark.stage.readsShuffleInput", "false"))
-      .exists(_.toBoolean)
+    val props        = taskSet.taskSet.properties
+    def boolProp(k: String) = Option(props).map(_.getProperty(k, "false")).exists(_.toBoolean)
+    val readsShuffle = boolProp("spark.stage.readsShuffleInput")
+    val writesShuffle = boolProp("spark.stage.writesShuffleOutput")
+    val readsRange   = boolProp("spark.stage.readsRangePartitioned")
 
-    // scope name kept for logging/diagnostics only, not for the decision
     val opName = Option(props).flatMap(p => Option(p.getProperty("spark.rdd.scope")))
       .flatMap(s => """"name"\s*:\s*"([^"]+)"""".r.findFirstMatchIn(s).map(_.group(1)))
       .getOrElse("Unknown")
 
-    val opType = if (readsShuffle) ShuffleLight else ScanHeavy
+    val opType =
+      if (!readsShuffle)      ScanHeavy   // leaf scan, regardless of whether it writes a shuffle
+      else if (writesShuffle) JoinReduce  // intermediate reduce: reads a shuffle, feeds another
+      else if (readsRange)    SortReduce  // range-partitioned input = ORDER BY
+      else                    AggReduce   // hash-partitioned terminal reduce
 
     logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} op='$opName' " +
-            s"readsShuffle=$readsShuffle tasks=${taskSet.numTasks} -> $opType")
-
+      s"readsShuffle=$readsShuffle writesShuffle=$writesShuffle readsRange=$readsRange " +
+      s"tasks=${taskSet.numTasks} -> $opType")
     opType
   }
-
-  // // Call this to get the effective weight for a host given the current operation type.
-  // // Returns 0 to exclude, otherwise the configured weight.
-  // private def effectiveHostWeight(host: String, op: OperationType): Int = {
-  //   val baseWeight = hostWeight(host)  // your existing method
-  //   op match {
-  //     case ScanHeavy =>
-  //       if (operationAwareSchedulingEnabled && slowHost.contains(host)) 0
-  //       else baseWeight
-  //     case ShuffleLight | Other =>
-  //       // Always include — use base weight (at least 1)
-  //       if (baseWeight <= 0) 1 else baseWeight
-  //   }
-  // }
 
   private def fastHostWaves(numTasks: Int): Int =
     math.ceil(numTasks.toDouble / math.max(fastHostCores, 1)).toInt
 
   private def effectiveSlowdown(op: OperationType): Double = op match {
-    case ScanHeavy            => scanSlowdown
-    case ShuffleLight | Other => reduceSlowdown
+    case ScanHeavy  => scanSlowdown
+    case AggReduce  => aggReduceSlowdown
+    case SortReduce => sortReduceSlowdown
+    case JoinReduce => joinReduceSlowdown
   }
 
   private def slowHostFits(numTasks: Int, op: OperationType): Boolean =
     fastHostWaves(numTasks) > effectiveSlowdown(op)
 
-  private def effectiveHostWeight(host: String, op: OperationType, numTasks: Int): Int = {
+  private def effectiveHostWeight(
+      host: String,
+      op: OperationType,
+      numTasks: Int): Int = {
     val baseWeight = hostWeight(host)
     if (!operationAwareSchedulingEnabled || !slowHost.contains(host)) {
       baseWeight
     } else {
-      val waves = fastHostWaves(numTasks)
-      val fits  = slowHostFits(numTasks, op)
+      val waves      = fastHostWaves(numTasks)
+      val r          = effectiveSlowdown(op)
+      val fits       = slowHostFits(numTasks, op)
+      // val capReached = oneWaveCapEnabled && slowHostLaunched >= slowHostCap
+      val include    = fits //&& !capReached
       logInfo(s"[OpAwareSched] slowHost=$host op=$op tasks=$numTasks " +
-        s"waves=$waves r=${effectiveSlowdown(op)} fits=$fits -> ${if (fits) "INCLUDE" else "EXCLUDE"}")
-      if (fits) math.max(baseWeight, 1) else 0
+        s"waves=$waves r=$r fits=$fits -> ${if (include) "INCLUDE" else "EXCLUDE"}")//" launched=$slowHostLaunched/$slowHostCap " +
+        // s"capReached=$capReached -> ${if (include) "INCLUDE" else "EXCLUDE"}")
+      if (include) math.max(baseWeight, 1) else 0
     }
   }
 
