@@ -1360,6 +1360,7 @@ private[spark] class TaskSetManager(
    */
   private def computeValidLocalityLevels(): Array[TaskLocality.TaskLocality] = {
     import TaskLocality.{PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY}
+    // import TaskLocality.ANY
     val levels = new ArrayBuffer[TaskLocality.TaskLocality]
     if (!pendingTasks.forExecutor.isEmpty &&
         pendingTasks.forExecutor.keySet.exists(sched.isExecutorAlive(_))) {

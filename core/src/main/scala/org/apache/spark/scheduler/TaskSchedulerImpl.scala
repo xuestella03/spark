@@ -376,25 +376,30 @@ private[spark] class TaskSchedulerImpl(
    * @return tuple of (no delay schedule rejects?, option of min locality of launched task)
    */
   private def resourceOfferSingleTaskSet(
-      taskSet: TaskSetManager,
-      maxLocality: TaskLocality,
-      shuffledOffers: Seq[WorkerOffer],
-      availableCpus: Array[Int],
-      availableResources: Array[ExecutorResourcesAmounts],
-      tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
+    taskSet: TaskSetManager,
+    maxLocality: TaskLocality,
+    shuffledOffers: Seq[WorkerOffer],
+    availableCpus: Array[Int],
+    availableResources: Array[ExecutorResourcesAmounts],
+    tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
     : (Boolean, Option[TaskLocality]) = {
     var noDelayScheduleRejects = true
     var minLaunchedLocality: Option[TaskLocality] = None
-    // nodes and executors that are excluded for the entire application have already been
-    // filtered out by this point
+    // Compute operation type once per taskSet, not per offer
+    val opType = if (operationAwareSchedulingEnabled) Some(classifyOperation(taskSet)) else None
     for (i <- shuffledOffers.indices) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
       val taskSetRpID = taskSet.taskSet.resourceProfileId
-
-      // check whether the task can be scheduled to the executor base on resource profile.
-      if (sc.resourceProfileManager
-        .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
+      // val slowLaunched = slowHostLaunchCount.getOrDefault(taskSet.taskSet.id, 0).intValue()
+      val weight = opType match {
+        case Some(op) => effectiveHostWeight(host, op, taskSet.numTasks)//, slowLaunched)
+        case None     => hostWeight(host)
+      }
+      if (weight <= 0) {
+        logInfo(s"[WeightedSched] Host $host excluded (weight=0), skipping offer $i")
+      } else if (sc.resourceProfileManager.canBeScheduled(
+        taskSetRpID, shuffledOffers(i).resourceProfileId)) {
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, availableCpus(i),
           availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
@@ -488,17 +493,20 @@ private[spark] class TaskSchedulerImpl(
 
   /**
     1. Hardcoded executor type
-    * Map executor type to score 
-    * Sort by score and shuffle within each type (shuffling TODO)
-    * 
+      * Map executor type to score 
+      * Sort by score and shuffle within each type (shuffling TODO)
+      
     2. Available memory
-    * Call sc.getExecutorMemoryStatus; returns map[String, (Long, Long)] with key executorID 
-      (host:port) and value (Maximum Memory, Remaining Memory); this needs to get changed because
-      it basically calls the API every time. 
-    * So the alternative is to piggy-back off of HeartbeatReceiver; 
-    * Sort by ratio (remaining / max), desc
-    * 
-    3. 
+      * Call sc.getExecutorMemoryStatus; returns map[String, (Long, Long)] with key executorID 
+        (host:port) and value (Maximum Memory, Remaining Memory); this needs to get changed because
+        it basically calls the API every time. 
+      * So the alternative is to piggy-back off of HeartbeatReceiver; 
+      * Sort by ratio (remaining / max), desc
+    
+    3. Task Placement
+      * Sort different kinds of tasks based on hints. 
+      * PreferHighCPU and PreferHighMemory
+      
     */
 
 
@@ -509,6 +517,250 @@ private[spark] class TaskSchedulerImpl(
    */
 
 
+  // def resourceOffers(
+  //     offers: IndexedSeq[WorkerOffer],
+  //     isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
+  //   // Mark each worker as alive and remember its hostname
+  //   // Also track if new executor is added
+  //   var newExecAvail = false
+  //   for (o <- offers) {
+  //     if (!hostToExecutors.contains(o.host)) {
+  //       hostToExecutors(o.host) = new HashSet[String]()
+  //     }
+  //     if (!executorIdToRunningTaskIds.contains(o.executorId)) {
+  //       hostToExecutors(o.host) += o.executorId
+  //       executorAdded(o.executorId, o.host)
+  //       executorIdToHost(o.executorId) = o.host
+  //       executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
+  //       newExecAvail = true
+  //     }
+  //   }
+  //   val hosts = offers.map(_.host).distinct
+  //   for ((host, Some(rack)) <- hosts.zip(getRacksForHosts(hosts))) {
+  //     hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
+  //   }
+
+  //   // Before making any offers, include any nodes whose expireOnFailure timeout has expired. Do
+  //   // this here to avoid a separate thread and added synchronization overhead, and also because
+  //   // updating the excluded executors and nodes is only relevant when task offers are being made.
+  //   healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())
+
+  //   val filteredOffers = healthTrackerOpt.map { healthTracker =>
+  //     offers.filter { offer =>
+  //       !healthTracker.isNodeExcluded(offer.host) &&
+  //         !healthTracker.isExecutorExcluded(offer.executorId)
+  //     }
+  //   }.getOrElse(offers)
+
+
+  //   //
+  //   // Instead of the next section, do this:
+
+  //   /* 
+
+  //   // Sort offers based on capability (hardcoded)
+  //   scoredOffers = filteredOffers.sort(key=offer: capabilityScore(offer))
+
+  //   // Classify which kind of 
+
+  //   */
+
+
+  //   val shuffledOffers = shuffleOffers(filteredOffers)
+
+
+   /**
+   * Weighted scheduling for heterogeneous executors.
+   *
+   * Each executor is mapped to a weight read from spark conf:
+   *   spark.heterogeneous.executor.weights = "host1:4,host2:1"
+   *
+   * Higher weight = more capable = gets proportionally more tasks offered first.
+   * Within the same weight tier, offers are shuffled randomly to avoid starvation.
+   *
+   * With spark.executor.cores=1, each core on each physical node becomes its own
+   * WorkerOffer, so we get fine-grained control: Pi 5 cores get weight 4, Pi 3B+ cores
+   * get weight 1. Over a stage with 8 tasks, Pi 5 will tend to receive 6-7 and Pi 3B+ 1-2,
+   * roughly proportional to their relative throughput.
+   */
+
+  /**
+   * Parse "host1:4,host2:1" into Map("host1" -> 4, "host2" -> 1).
+   * Falls back to weight 1 for any host not listed (homogeneous fallback).
+   */
+  private val stageAwareSchedulingEnabled: Boolean =
+  conf.getBoolean("spark.heterogeneous.scheduling.stageAware", defaultValue = false)
+
+  private val executorWeights: Map[String, Int] = {
+    conf.getOption("spark.heterogeneous.executor.weights").map { weightStr =>
+      weightStr.split(",").flatMap { entry =>
+        entry.split(":") match {
+          case Array(host, weight) => Some(host.trim -> weight.trim.toInt)
+          case _                   => None
+        }
+      }.toMap
+    }.getOrElse(Map.empty)
+  }
+
+  /**
+   * Return the weight for a given host. Defaults to 1 if not configured.
+   */
+  private def hostWeight(host: String): Int =
+    executorWeights.getOrElse(host, 1)
+
+  /**
+   * Order offers by weight descending, shuffling within each weight tier so that
+   * equal-weight executors don't always get the same task slot order.
+   *
+   * Example with Pi 5 (weight=4) having 4 executors and Pi 3B+ (weight=1) having 4:
+   *   Result: [pi5-exec0, pi5-exec2, pi5-exec1, pi5-exec3, pi3-exec1, pi3-exec0, pi3-exec2, pi3-exec3]
+   *
+   * Because resourceOfferSingleTaskSet iterates offers in order and assigns tasks greedily,
+   * higher-weight executors will fill up first.
+   */
+  private def weightedOrderOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] = {
+    if (executorWeights.isEmpty) {
+      // No weights configured — fall back to existing random shuffle (no regression)
+      Random.shuffle(offers)
+    } else {
+      offers
+        .groupBy(o => hostWeight(o.host))   // group by weight
+        .toSeq
+        .sortBy(-_._1)                       // sort groups highest weight first
+        .flatMap { case (_, group) =>
+          Random.shuffle(group)              // shuffle within each weight tier
+        }
+        .toIndexedSeq
+    }
+  }
+
+  private sealed trait StageSpeed
+  private case object SlowStage extends StageSpeed
+  private case object FastStage extends StageSpeed
+
+  private def classifyStageSpeed(taskSet: TaskSetManager): StageSpeed = {
+    if (taskSet.numTasks == 1) FastStage
+    else SlowStage
+  }
+
+  private val operationAwareSchedulingEnabled: Boolean =
+    conf.getBoolean("spark.heterogeneous.scheduling.operationAware", defaultValue = false)
+
+  // private val computeHeavyTaskThreshold: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.computeHeavyThreshold", defaultValue = 12)
+
+  private val slowHost: Option[String] =
+    conf.getOption("spark.heterogeneous.scheduling.slowHost").map(_.trim)
+  
+  private val scanSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.scan.slowdown", 5.0)
+  private val aggReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.aggReduce.slowdown", 4.5)
+  private val sortReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.sortReduce.slowdown", 7.0)
+  private val joinReduceSlowdown: Double =
+    conf.getDouble("spark.heterogeneous.scheduling.joinReduce.slowdown", 99.0) // ~never fits
+  private val fastHostCores: Int =
+    conf.getInt("spark.heterogeneous.scheduling.fastHostCores", 4)
+
+  // one-wave
+  // private val oneWaveCapEnabled: Boolean =
+  //   conf.getBoolean("spark.heterogeneous.scheduling.oneWaveCap", defaultValue = false)
+  // private val slowHostCores: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.slowHostCores", 4)
+  // private val slowHostMaxTasksConf: Int =
+  //   conf.getInt("spark.heterogeneous.scheduling.slowHostMaxTasks", -1)
+  // private def slowHostCap: Int =
+  //   if (slowHostMaxTasksConf > 0) slowHostMaxTasksConf else slowHostCores
+
+  // // per stage-attempt id -> tasks already launched on the slow host
+  // private val slowHostLaunchCount =
+  //   new java.util.concurrent.ConcurrentHashMap[String, Integer]()
+  
+  
+  private sealed trait OperationType
+  private case object ScanHeavy  extends OperationType // file scan / map side
+  private case object AggReduce  extends OperationType // hash-partitioned terminal reduce
+  private case object SortReduce extends OperationType // range-partitioned reduce (ORDER BY)
+  private case object JoinReduce extends OperationType // reads AND writes shuffle (SMJ etc.)
+
+  private def classifyOperation(taskSet: TaskSetManager): OperationType = {
+    val props        = taskSet.taskSet.properties
+    def boolProp(k: String) = Option(props).map(_.getProperty(k, "false")).exists(_.toBoolean)
+    val readsShuffle = boolProp("spark.stage.readsShuffleInput")
+    val writesShuffle = boolProp("spark.stage.writesShuffleOutput")
+    val readsRange   = boolProp("spark.stage.readsRangePartitioned")
+
+    val opName = Option(props).flatMap(p => Option(p.getProperty("spark.rdd.scope")))
+      .flatMap(s => """"name"\s*:\s*"([^"]+)"""".r.findFirstMatchIn(s).map(_.group(1)))
+      .getOrElse("Unknown")
+
+    val opType =
+      if (!readsShuffle)      ScanHeavy   // leaf scan, regardless of whether it writes a shuffle
+      else if (writesShuffle) JoinReduce  // intermediate reduce: reads a shuffle, feeds another
+      else if (readsRange)    SortReduce  // range-partitioned input = ORDER BY
+      else                    AggReduce   // hash-partitioned terminal reduce
+
+    logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} op='$opName' " +
+      s"readsShuffle=$readsShuffle writesShuffle=$writesShuffle readsRange=$readsRange " +
+      s"tasks=${taskSet.numTasks} -> $opType")
+    opType
+  }
+
+  private def fastHostWaves(numTasks: Int): Int =
+    math.ceil(numTasks.toDouble / math.max(fastHostCores, 1)).toInt
+
+  private def effectiveSlowdown(op: OperationType): Double = op match {
+    case ScanHeavy  => scanSlowdown
+    case AggReduce  => aggReduceSlowdown
+    case SortReduce => sortReduceSlowdown
+    case JoinReduce => joinReduceSlowdown
+  }
+
+  private def slowHostFits(numTasks: Int, op: OperationType): Boolean =
+    fastHostWaves(numTasks) > effectiveSlowdown(op)
+
+  private def effectiveHostWeight(
+      host: String,
+      op: OperationType,
+      numTasks: Int): Int = {
+    val baseWeight = hostWeight(host)
+    if (!operationAwareSchedulingEnabled || !slowHost.contains(host)) {
+      baseWeight
+    } else {
+      val waves      = fastHostWaves(numTasks)
+      val r          = effectiveSlowdown(op)
+      val fits       = slowHostFits(numTasks, op)
+      // val capReached = oneWaveCapEnabled && slowHostLaunched >= slowHostCap
+      val include    = fits //&& !capReached
+      logInfo(s"[OpAwareSched] slowHost=$host op=$op tasks=$numTasks " +
+        s"waves=$waves r=$r fits=$fits -> ${if (include) "INCLUDE" else "EXCLUDE"}")//" launched=$slowHostLaunched/$slowHostCap " +
+        // s"capReached=$capReached -> ${if (include) "INCLUDE" else "EXCLUDE"}")
+      if (include) math.max(baseWeight, 1) else 0
+    }
+  }
+
+
+  private def stageAwareOrderOffers(
+      offers: IndexedSeq[WorkerOffer],   
+      speed: StageSpeed): IndexedSeq[WorkerOffer] = {
+    if (executorWeights.isEmpty) return Random.shuffle(offers)
+    val grouped = offers.groupBy(o => hostWeight(o.host)).toSeq
+    speed match {
+      case SlowStage =>
+        grouped.sortBy(-_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+      case FastStage =>
+        grouped.sortBy(_._1).flatMap { case (_, g) => Random.shuffle(g) }.toIndexedSeq
+    }
+  }
+
+
+
+  /**
+   * Called by cluster manager to offer resources on workers. We respond by asking our active task
+   * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
+   * that tasks are balanced across the cluster.
+   */
   def resourceOffers(
       offers: IndexedSeq[WorkerOffer],
       isAllFreeResources: Boolean = true): Seq[Seq[TaskDescription]] = synchronized {
@@ -532,9 +784,6 @@ private[spark] class TaskSchedulerImpl(
       hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
     }
 
-    // Before making any offers, include any nodes whose expireOnFailure timeout has expired. Do
-    // this here to avoid a separate thread and added synchronization overhead, and also because
-    // updating the excluded executors and nodes is only relevant when task offers are being made.
     healthTrackerOpt.foreach(_.applyExcludeOnFailureTimeout())
 
     val filteredOffers = healthTrackerOpt.map { healthTracker =>
@@ -544,15 +793,23 @@ private[spark] class TaskSchedulerImpl(
       }
     }.getOrElse(offers)
 
-    val shuffledOffers = shuffleOffers(filteredOffers)
-    // Build a list of tasks to assign to each worker.
-    // Note the size estimate here might be off with different ResourceProfiles but should be
-    // close estimate
+    // Use weighted ordering as the canonical index basis.
+    // If stageAware is enabled we re-order per taskSet inside the loop below.
+    val shuffledOffers = weightedOrderOffers(filteredOffers)
+
+    logInfo(s"[WeightedSched] Offer order: ${shuffledOffers.map(o => s"${o.host}(w=${hostWeight(o.host)})").mkString(", ")}")
+
+    // Build index-parallel arrays keyed to shuffledOffers.
     val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](o.cores / CPUS_PER_TASK))
     val availableResources = shuffledOffers.map(_.resources).toArray
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
+
+    // Index from executorId -> position in shuffledOffers (for barrier tasks later).
+    val executorIdToIndex: Map[String, Int] =
+      shuffledOffers.zipWithIndex.map { case (o, i) => o.executorId -> i }.toMap
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
+
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
         taskSet.parent.name, taskSet.name, taskSet.runningTasks))
@@ -584,6 +841,31 @@ private[spark] class TaskSchedulerImpl(
           log"${MDC(LogKeys.TASK_SET_NAME, taskSet.numTasks)} slots, while the total " +
           log"number of available slots is ${MDC(LogKeys.NUM_SLOTS, numBarrierSlotsAvailable)}.")
       } else {
+
+        if (operationAwareSchedulingEnabled) {
+          val op = classifyOperation(taskSet)
+          logInfo(s"[OpAwareSched] Stage ${taskSet.stageId} op=$op " +
+            s"(tasks=${taskSet.numTasks})")
+        }
+        // Per-taskSet offer ordering. If stageAware is on, classify and reorder.
+        // orderedOffers must be a permutation of shuffledOffers so that the index-parallel
+        // arrays (tasks, availableCpus, availableResources) remain consistent.
+        val orderedOffers: IndexedSeq[WorkerOffer] = {
+          if (stageAwareSchedulingEnabled) {
+            val speed = classifyStageSpeed(taskSet)
+            logInfo(s"[StageAwareSched] Stage ${taskSet.stageId} classified as $speed " +
+              s"(tasks=${taskSet.numTasks}, localities=${taskSet.myLocalityLevels.mkString(",")})")
+            stageAwareOrderOffers(shuffledOffers, speed)
+          } else {
+            shuffledOffers
+          }
+        }
+
+        // Remap index-parallel arrays to match orderedOffers order.
+        val orderedTasks           = orderedOffers.map(o => tasks(executorIdToIndex(o.executorId)))
+        val orderedAvailableCpus   = orderedOffers.map(o => availableCpus(executorIdToIndex(o.executorId))).toArray
+        val orderedAvailableRes    = orderedOffers.map(o => availableResources(executorIdToIndex(o.executorId))).toArray
+
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
@@ -591,13 +873,20 @@ private[spark] class TaskSchedulerImpl(
           var launchedTaskAtCurrentMaxLocality = false
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
-              taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks)
+              taskSet, currentMaxLocality, orderedOffers, orderedAvailableCpus,
+              orderedAvailableRes, orderedTasks)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
             globalMinLocality = minTaskLocality(globalMinLocality, minLocality)
           } while (launchedTaskAtCurrentMaxLocality)
+        }
+
+        // Write back mutated cpu/resource state from ordered arrays to canonical shuffledOffers arrays.
+        orderedOffers.zipWithIndex.foreach { case (o, oi) =>
+          val si = executorIdToIndex(o.executorId)
+          availableCpus(si) = orderedAvailableCpus(oi)
+          availableResources(si) = orderedAvailableRes(oi)
         }
 
         if (!legacyLocalityWaitReset) {
@@ -728,8 +1017,8 @@ private[spark] class TaskSchedulerImpl(
                 task.assignedResources,
                 launchTime)
               addRunningTask(taskDesc.taskId, taskDesc.executorId, taskSet)
-              tasks(task.assignedOfferIndex) += taskDesc
-              shuffledOffers(task.assignedOfferIndex).address.get -> taskDesc
+              tasks(task.assignedOfferIndex) += taskDesc // might be tied to shuffledOffers, not orderedOffers, need to fix
+              orderedOffers(task.assignedOfferIndex).address.get -> taskDesc
             }
 
             // materialize the barrier coordinator.

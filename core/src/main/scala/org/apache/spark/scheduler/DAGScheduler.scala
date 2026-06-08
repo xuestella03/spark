@@ -54,6 +54,7 @@ import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
 import org.apache.spark.util._
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.RangePartitioner 
 
 /**
  * The high-level scheduling layer that implements stage-oriented scheduling. It computes a DAG of
@@ -1629,6 +1630,21 @@ private[spark] class DAGScheduler(
     // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
     // with this Stage
     val properties = jobIdToActiveJob(jobId).properties
+
+    // CHANGES
+    val inputShuffleDeps    = getShuffleDependenciesAndResourceProfiles(stage.rdd)._1
+    val readsShuffleInput   = inputShuffleDeps.nonEmpty
+    val readsRangePartitioned = inputShuffleDeps.exists(_.partitioner.isInstanceOf[RangePartitioner[_, _]])
+    val writesShuffleOutput = stage.isInstanceOf[ShuffleMapStage]
+
+    val taskSetProperties = new java.util.Properties()
+    if (properties != null) taskSetProperties.putAll(properties)
+    taskSetProperties.setProperty("spark.stage.readsShuffleInput",     readsShuffleInput.toString)
+    taskSetProperties.setProperty("spark.stage.readsRangePartitioned", readsRangePartitioned.toString)
+    taskSetProperties.setProperty("spark.stage.writesShuffleOutput",   writesShuffleOutput.toString)
+    //
+
+
     addPySparkConfigsToProperties(stage, properties)
 
     runningStages += stage
@@ -1780,8 +1796,9 @@ private[spark] class DAGScheduler(
         case _: ResultStage => None
       }
 
+      // CHANGE HERE
       taskScheduler.submitTasks(new TaskSet(
-        tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
+        tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, taskSetProperties, // change here 
         stage.resourceProfileId, shuffleId))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
