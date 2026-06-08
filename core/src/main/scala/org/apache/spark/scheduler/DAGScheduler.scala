@@ -1634,8 +1634,7 @@ private[spark] class DAGScheduler(
     // CHANGES
     val inputShuffleDeps    = getShuffleDependenciesAndResourceProfiles(stage.rdd)._1
     val readsShuffleInput   = inputShuffleDeps.nonEmpty
-    val readsRangePartitioned =
-      inputShuffleDeps.exists(_.partitioner.isInstanceOf[RangePartitioner[_, _]])
+    val readsRangePartitioned = inputShuffleDeps.exists(_.partitioner.isInstanceOf[RangePartitioner[_, _]])
     val writesShuffleOutput = stage.isInstanceOf[ShuffleMapStage]
 
     val taskSetProperties = new java.util.Properties()
